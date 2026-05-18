@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 from typing import Any
 
 
@@ -13,6 +15,14 @@ class GeminiConfigurationError(RuntimeError):
 
 class GeminiRequestError(RuntimeError):
     """Raised when Gemini rejects or fails a generation request."""
+
+
+DEFAULT_MODEL_FALLBACKS: tuple[str, ...] = (
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+)
 
 
 def normalize_model_name(model: str) -> str:
@@ -27,6 +37,61 @@ def normalize_model_name(model: str) -> str:
     if cleaned.startswith("models/"):
         return cleaned.removeprefix("models/")
     return cleaned
+
+
+def resolve_model_chain(primary: str | None = None) -> list[str]:
+    """Build an ordered list of models to try, primary first, without duplicates."""
+    env_fallbacks = os.getenv("GEMINI_MODEL_FALLBACKS", "").strip()
+    if env_fallbacks:
+        candidates = [
+            normalize_model_name(part)
+            for part in env_fallbacks.split(",")
+            if part.strip()
+        ]
+    else:
+        candidates = [normalize_model_name(name) for name in DEFAULT_MODEL_FALLBACKS]
+
+    if primary:
+        primary_name = normalize_model_name(primary)
+        chain = [primary_name]
+        for model in candidates:
+            if model not in chain:
+                chain.append(model)
+        return chain
+
+    deduped: list[str] = []
+    for model in candidates:
+        if model not in deduped:
+            deduped.append(model)
+    return deduped
+
+
+def _should_try_next_model(exc: Exception) -> bool:
+    """Return True when another model in the chain may succeed."""
+    code = getattr(exc, "code", None)
+    if code in {404, 429, 500, 503}:
+        return True
+
+    message = str(exc).lower()
+    retriable_markers = (
+        "resource_exhausted",
+        "quota",
+        "rate limit",
+        "429",
+        "unavailable",
+        "not found",
+        "unexpected model name",
+    )
+    return any(marker in message for marker in retriable_markers)
+
+
+def _retry_delay_seconds(exc: Exception) -> float:
+    """Use API retry hints when present; otherwise a short pause."""
+    message = str(exc)
+    match = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", message, flags=re.IGNORECASE)
+    if match:
+        return min(float(match.group(1)), 60.0)
+    return 1.0
 
 
 class GeminiClient:
@@ -47,9 +112,10 @@ class GeminiClient:
                 "Missing Gemini SDK. Install it with: pip install google-genai"
             ) from exc
 
-        self.model = normalize_model_name(
-            model or os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
-        )
+        primary_model = model or os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+        self._model_chain = resolve_model_chain(primary_model)
+        self._active_model = self._model_chain[0]
+        self.model = self._active_model
         self.temperature = temperature
         self._errors = errors
         self._types = types
@@ -86,6 +152,13 @@ class GeminiClient:
 
         return config
 
+    def _models_to_try(self) -> list[str]:
+        ordered = [self._active_model]
+        for model in self._model_chain:
+            if model not in ordered:
+                ordered.append(model)
+        return ordered
+
     def generate_json(
         self,
         *,
@@ -100,24 +173,38 @@ class GeminiClient:
             "Use only the supplied JSON input. Do not scrape, browse, or invent external facts. "
             "Return valid JSON only. All numeric scores must be on a 0-100 scale."
         )
-        try:
-            response = self._client.models.generate_content(
-                model=self.model,
-                contents=task,
-                config=self._generation_config(
-                    system_instruction=system_instruction,
-                    response_schema=response_schema,
-                ),
-            )
-        except self._errors.APIError as exc:
-            raise GeminiRequestError(
-                f"{agent_name} Gemini request failed for model '{self.model}'. "
-                "Check GEMINI_MODEL or unset it to use the default "
-                "'gemini-3-flash-preview'. Original error: "
-                f"{exc}"
-            ) from exc
+        failures: list[str] = []
+        models_to_try = self._models_to_try()
+        for index, model_name in enumerate(models_to_try):
+            try:
+                response = self._client.models.generate_content(
+                    model=model_name,
+                    contents=task,
+                    config=self._generation_config(
+                        system_instruction=system_instruction,
+                        response_schema=response_schema,
+                    ),
+                )
+            except self._errors.APIError as exc:
+                failures.append(f"{model_name}: {exc}")
+                if _should_try_next_model(exc) and index < len(models_to_try) - 1:
+                    time.sleep(_retry_delay_seconds(exc))
+                    continue
+                break
+            else:
+                self._active_model = model_name
+                self.model = model_name
+                try:
+                    return json.loads(response.text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"{agent_name} returned invalid JSON: {response.text}"
+                    ) from exc
 
-        try:
-            return json.loads(response.text)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{agent_name} returned invalid JSON: {response.text}") from exc
+        tried = ", ".join(models_to_try)
+        detail = " | ".join(failures) if failures else "unknown error"
+        raise GeminiRequestError(
+            f"{agent_name} Gemini request failed for all models [{tried}]. "
+            "Set GEMINI_MODEL / GEMINI_MODEL_FALLBACKS or enable billing. "
+            f"Errors: {detail}"
+        )

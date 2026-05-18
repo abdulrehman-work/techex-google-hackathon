@@ -1,6 +1,11 @@
 import unittest
+from unittest.mock import patch
 
-from ai_trading_agent.gemini_client import normalize_model_name
+from ai_trading_agent.gemini_client import (
+    GeminiClient,
+    normalize_model_name,
+    resolve_model_chain,
+)
 from ai_trading_agent import run_pipeline
 
 
@@ -48,6 +53,67 @@ class FakeGeminiClient:
             },
         }
         return responses[agent_name]
+
+
+class GeminiClientFallbackTests(unittest.TestCase):
+    def test_resolve_model_chain_puts_primary_first(self):
+        with patch.dict("os.environ", {}, clear=True):
+            chain = resolve_model_chain("gemini-2.0-flash")
+        self.assertEqual(chain[0], "gemini-2.0-flash")
+        self.assertIn("gemini-3-flash-preview", chain)
+
+    @patch.dict(
+        "os.environ",
+        {"GEMINI_MODEL_FALLBACKS": "gemini-2.5-flash, gemini-2.0-flash-lite"},
+        clear=True,
+    )
+    def test_resolve_model_chain_honors_env_fallbacks(self):
+        chain = resolve_model_chain("gemini-3-flash-preview")
+        self.assertEqual(
+            chain,
+            ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash-lite"],
+        )
+
+    @patch("ai_trading_agent.gemini_client.time.sleep")
+    @patch("ai_trading_agent.gemini_client.GeminiClient.__init__", lambda self, **kwargs: None)
+    def test_generate_json_switches_model_after_quota_error(self, _mock_sleep) -> None:
+        client = GeminiClient.__new__(GeminiClient)
+        client._active_model = "gemini-3-flash-preview"
+        client._model_chain = ["gemini-3-flash-preview", "gemini-2.0-flash"]
+        client.model = client._active_model
+        client.temperature = 0.2
+
+        class FakeAPIError(Exception):
+            code = 429
+
+        client._errors = type("Errors", (), {"APIError": FakeAPIError})()
+        client._types = type("Types", (), {"GenerateContentConfig": type("Cfg", (), {"model_fields": {}})})()
+
+        class FakeResponse:
+            text = '{"score": 70, "verdict": "moderate", "reasoning": "ok", "keyDrivers": ["a"]}'
+
+        calls: list[str] = []
+
+        class FakeModels:
+            def generate_content(self, *, model, contents, config):
+                calls.append(model)
+                if model == "gemini-3-flash-preview":
+                    raise FakeAPIError("429 RESOURCE_EXHAUSTED quota exceeded")
+                return FakeResponse()
+
+        client._client = type("Client", (), {"models": FakeModels()})()
+
+        result = client.generate_json(
+            agent_name="research_agent",
+            role="Financial analyst",
+            task="analyze",
+            payload={},
+            response_schema={},
+        )
+
+        self.assertEqual(result["score"], 70)
+        self.assertEqual(calls, ["gemini-3-flash-preview", "gemini-2.0-flash"])
+        self.assertEqual(client.model, "gemini-2.0-flash")
 
 
 class PipelineSmokeTest(unittest.TestCase):
