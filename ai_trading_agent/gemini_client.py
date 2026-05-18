@@ -18,10 +18,10 @@ class GeminiRequestError(RuntimeError):
 
 
 DEFAULT_MODEL_FALLBACKS: tuple[str, ...] = (
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
     "gemini-2.0-flash",
+    "gemini-2.5-flash",
     "gemini-2.0-flash-lite",
+    "gemini-3-flash-preview",
 )
 
 
@@ -66,9 +66,39 @@ def resolve_model_chain(primary: str | None = None) -> list[str]:
     return deduped
 
 
+def _api_error_code(exc: Exception) -> int | None:
+    """Extract an HTTP-style status code from SDK errors."""
+    for attr in ("code", "status_code", "status"):
+        value = getattr(exc, attr, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+
+    match = re.search(r"\b([45]\d{2})\b", str(exc))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _should_retry_same_model(exc: Exception) -> bool:
+    """Retry the current model for transient overload errors."""
+    code = _api_error_code(exc)
+    if code in {500, 503}:
+        return True
+
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in ("unavailable", "high demand", "overloaded", "try again later")
+    )
+
+
 def _should_try_next_model(exc: Exception) -> bool:
     """Return True when another model in the chain may succeed."""
-    code = getattr(exc, "code", None)
+    code = _api_error_code(exc)
     if code in {404, 429, 500, 503}:
         return True
 
@@ -79,19 +109,39 @@ def _should_try_next_model(exc: Exception) -> bool:
         "rate limit",
         "429",
         "unavailable",
+        "high demand",
         "not found",
         "unexpected model name",
+        "overloaded",
     )
     return any(marker in message for marker in retriable_markers)
 
 
-def _retry_delay_seconds(exc: Exception) -> float:
-    """Use API retry hints when present; otherwise a short pause."""
+def _same_model_retry_limit(exc: Exception) -> int:
+    """How many attempts to make on one model before switching."""
+    configured = os.getenv("GEMINI_MAX_RETRIES", "").strip()
+    if configured.isdigit():
+        return max(1, int(configured))
+
+    code = _api_error_code(exc)
+    if code == 503:
+        return 3
+    if code == 429:
+        return 1
+    return 2
+
+
+def _retry_delay_seconds(exc: Exception, attempt: int) -> float:
+    """Use API retry hints when present; otherwise exponential backoff."""
     message = str(exc)
     match = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", message, flags=re.IGNORECASE)
     if match:
         return min(float(match.group(1)), 60.0)
-    return 1.0
+
+    code = _api_error_code(exc)
+    if code == 503:
+        return min(2.0 * attempt, 8.0)
+    return min(1.0 * attempt, 4.0)
 
 
 class GeminiClient:
@@ -112,7 +162,7 @@ class GeminiClient:
                 "Missing Gemini SDK. Install it with: pip install google-genai"
             ) from exc
 
-        primary_model = model or os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+        primary_model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
         self._model_chain = resolve_model_chain(primary_model)
         self._active_model = self._model_chain[0]
         self.model = self._active_model
@@ -176,30 +226,43 @@ class GeminiClient:
         failures: list[str] = []
         models_to_try = self._models_to_try()
         for index, model_name in enumerate(models_to_try):
-            try:
-                response = self._client.models.generate_content(
-                    model=model_name,
-                    contents=task,
-                    config=self._generation_config(
-                        system_instruction=system_instruction,
-                        response_schema=response_schema,
-                    ),
-                )
-            except self._errors.APIError as exc:
-                failures.append(f"{model_name}: {exc}")
-                if _should_try_next_model(exc) and index < len(models_to_try) - 1:
-                    time.sleep(_retry_delay_seconds(exc))
-                    continue
-                break
-            else:
-                self._active_model = model_name
-                self.model = model_name
+            for attempt in range(1, 4):
                 try:
-                    return json.loads(response.text)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"{agent_name} returned invalid JSON: {response.text}"
+                    response = self._client.models.generate_content(
+                        model=model_name,
+                        contents=task,
+                        config=self._generation_config(
+                            system_instruction=system_instruction,
+                            response_schema=response_schema,
+                        ),
+                    )
+                except self._errors.APIError as exc:
+                    failures.append(f"{model_name} (attempt {attempt}): {exc}")
+                    retry_limit = _same_model_retry_limit(exc)
+                    if _should_retry_same_model(exc) and attempt < retry_limit:
+                        time.sleep(_retry_delay_seconds(exc, attempt))
+                        continue
+
+                    if _should_try_next_model(exc) and index < len(models_to_try) - 1:
+                        time.sleep(_retry_delay_seconds(exc, attempt))
+                        break
+
+                    tried = ", ".join(models_to_try)
+                    detail = " | ".join(failures)
+                    raise GeminiRequestError(
+                        f"{agent_name} Gemini request failed for all models [{tried}]. "
+                        "Set GEMINI_MODEL / GEMINI_MODEL_FALLBACKS or enable billing. "
+                        f"Errors: {detail}"
                     ) from exc
+                else:
+                    self._active_model = model_name
+                    self.model = model_name
+                    try:
+                        return json.loads(response.text)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"{agent_name} returned invalid JSON: {response.text}"
+                        ) from exc
 
         tried = ", ".join(models_to_try)
         detail = " | ".join(failures) if failures else "unknown error"

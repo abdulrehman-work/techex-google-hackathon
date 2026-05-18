@@ -58,9 +58,9 @@ class FakeGeminiClient:
 class GeminiClientFallbackTests(unittest.TestCase):
     def test_resolve_model_chain_puts_primary_first(self):
         with patch.dict("os.environ", {}, clear=True):
-            chain = resolve_model_chain("gemini-2.0-flash")
-        self.assertEqual(chain[0], "gemini-2.0-flash")
-        self.assertIn("gemini-3-flash-preview", chain)
+            chain = resolve_model_chain("gemini-2.5-flash")
+        self.assertEqual(chain[0], "gemini-2.5-flash")
+        self.assertIn("gemini-2.0-flash", chain)
 
     @patch.dict(
         "os.environ",
@@ -114,6 +114,52 @@ class GeminiClientFallbackTests(unittest.TestCase):
         self.assertEqual(result["score"], 70)
         self.assertEqual(calls, ["gemini-3-flash-preview", "gemini-2.0-flash"])
         self.assertEqual(client.model, "gemini-2.0-flash")
+
+    @patch("ai_trading_agent.gemini_client.time.sleep")
+    @patch("ai_trading_agent.gemini_client.GeminiClient.__init__", lambda self, **kwargs: None)
+    def test_generate_json_retries_503_before_switching_model(self, _mock_sleep) -> None:
+        client = GeminiClient.__new__(GeminiClient)
+        client._active_model = "gemini-3-flash-preview"
+        client._model_chain = ["gemini-3-flash-preview", "gemini-2.0-flash"]
+        client.model = client._active_model
+        client.temperature = 0.2
+
+        class FakeAPIError(Exception):
+            def __init__(self, message: str) -> None:
+                super().__init__(message)
+                self.code = 503
+
+        client._errors = type("Errors", (), {"APIError": FakeAPIError})()
+        client._types = type("Types", (), {"GenerateContentConfig": type("Cfg", (), {"model_fields": {}})})()
+
+        class FakeResponse:
+            text = '{"status": "APPROVED", "reason": "ok", "finalNotes": "note"}'
+
+        attempts = {"gemini-3-flash-preview": 0}
+
+        class FakeModels:
+            def generate_content(self, *, model, contents, config):
+                attempts[model] += 1
+                if model == "gemini-3-flash-preview" and attempts[model] < 2:
+                    raise FakeAPIError(
+                        "503 UNAVAILABLE. high demand. Please try again later."
+                    )
+                return FakeResponse()
+
+        client._client = type("Client", (), {"models": FakeModels()})()
+        attempts["gemini-3-flash-preview"] = 0
+
+        result = client.generate_json(
+            agent_name="governance_agent",
+            role="Compliance auditor",
+            task="audit",
+            payload={},
+            response_schema={},
+        )
+
+        self.assertEqual(result["status"], "APPROVED")
+        self.assertEqual(attempts["gemini-3-flash-preview"], 2)
+        self.assertEqual(client.model, "gemini-3-flash-preview")
 
 
 class PipelineSmokeTest(unittest.TestCase):
