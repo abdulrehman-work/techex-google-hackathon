@@ -23,6 +23,7 @@ tests/
 ```bash
 uv venv .venv
 uv pip install -r requirements.txt --python .venv/bin/python
+uv pip install -e . --python .venv/bin/python
 source .venv/bin/activate
 export GEMINI_API_KEY="your-key"
 ```
@@ -81,3 +82,97 @@ The returned response includes:
 
 No scraping or ETL happens inside this package. The backend is expected to pass
 clean structured JSON.
+
+## Run The Backend API
+
+The FastAPI backend builds the stock context, sends it into the Gemini agent
+pipeline, and returns the final analysis in the `analysis` field.
+
+```bash
+source .venv/bin/activate
+export GEMINI_API_KEY="your-key"
+PYTHONPATH=backend uvicorn app.main:app --reload
+```
+
+If you start the server from inside the `backend/` directory, include the
+project root on `PYTHONPATH`:
+
+```bash
+cd backend
+PYTHONPATH=.. uvicorn app.main:app --reload
+```
+
+Analyze a ticker:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/analyze" \
+  -H "Content-Type: application/json" \
+  -d '{"ticker":"ENGRO"}'
+```
+
+If PSX blocks or rejects the upstream market-data request, this endpoint returns
+`502` with the upstream fetch error in `detail`.
+
+To test the AI pipeline without depending on PSX, post a complete structured
+context directly:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/analyze/context" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ticker": "ENGRO",
+    "companyProfile": {
+      "companyName": "Engro Corporation",
+      "sector": "Fertilizer / Conglomerate"
+    },
+    "stockData": {
+      "currentPrice": 312.5,
+      "previousClose": 308.2,
+      "changePercent": 1.4,
+      "volume": 1200000
+    },
+    "priceHistory": [
+      {
+        "date": "2026-05-15",
+        "close": 312.5,
+        "volume": 1200000
+      }
+    ],
+    "fundamentals": {
+      "eps": 18.2,
+      "peRatio": 8.1,
+      "dividendYield": 7.5,
+      "roe": 16.4,
+      "financialSummary": "The company reported stable earnings and maintained dividend payouts."
+    },
+    "news": [
+      {
+        "source": "Business Recorder",
+        "headline": "Fertilizer sector gains as market sentiment improves",
+        "snippet": "Investors showed renewed interest in fertilizer stocks."
+      }
+    ],
+    "macroContext": {
+      "sbpPolicyRate": "11.50%",
+      "pkrUsdTrend": "stable",
+      "inflationView": "moderating",
+      "oilPriceRisk": "medium",
+      "marketCondition": "neutral"
+    },
+    "riskMetrics": {
+      "dailyChangePercent": 1.4,
+      "simpleVolatility": "medium",
+      "volumeTrend": "increasing"
+    }
+  }'
+```
+
+If `GEMINI_API_KEY` is missing or Gemini rejects the request, `/api/analyze`
+returns a `502` with the AI pipeline error in `detail`.
+
+## Run Tests
+
+```bash
+PYTHONPATH=backend python -m unittest discover -s backend/tests
+python -m unittest discover -s tests
+```

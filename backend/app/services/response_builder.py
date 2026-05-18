@@ -19,7 +19,7 @@ class ResponseBuilder:
     ) -> AnalyzeResponse:
         response_meta = {
             "generatedAt": datetime.now(timezone.utc).isoformat(),
-            "agentPipeline": "skipped" if analysis and analysis.get("status") == "skipped" else "pending",
+            "agentPipeline": "completed" if analysis else "pending",
         }
         if meta:
             response_meta.update(meta)
