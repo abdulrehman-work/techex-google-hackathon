@@ -1,5 +1,10 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from app.api.routes.analyze import router as analyze_router
 from app.core.config import get_settings
