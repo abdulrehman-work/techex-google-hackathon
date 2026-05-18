@@ -54,10 +54,13 @@ class PsxClient:
         )
 
     def fetch_eod_bars(self, ticker: str) -> list[EodBar]:
-        with self._client() as client:
-            response = client.get(f"/timeseries/eod/{ticker}")
-            response.raise_for_status()
-            payload = response.json()
+        try:
+            with self._client() as client:
+                response = client.get(f"/timeseries/eod/{ticker}")
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPError as exc:
+            raise DataFetchError(f"PSX EOD request failed for {ticker}: {exc}") from exc
 
         if payload.get("status") != 1:
             raise DataFetchError(f"PSX EOD request failed for {ticker}.")
@@ -79,11 +82,14 @@ class PsxClient:
         return bars
 
     def fetch_latest_intraday_price(self, ticker: str) -> float | None:
-        with self._client() as client:
-            response = client.get(f"/timeseries/int/{ticker}")
-            if response.status_code >= 400:
-                return None
-            payload = response.json()
+        try:
+            with self._client() as client:
+                response = client.get(f"/timeseries/int/{ticker}")
+                if response.status_code >= 400:
+                    return None
+                payload = response.json()
+        except httpx.HTTPError:
+            return None
 
         data = payload.get("data") or []
         if not data:
@@ -91,10 +97,13 @@ class PsxClient:
         return float(data[0][1])
 
     def fetch_company_page(self, ticker: str) -> str:
-        with self._client() as client:
-            response = client.get(f"/company/{ticker}")
-            response.raise_for_status()
-            return response.text
+        try:
+            with self._client() as client:
+                response = client.get(f"/company/{ticker}")
+                response.raise_for_status()
+                return response.text
+        except httpx.HTTPError as exc:
+            raise DataFetchError(f"PSX company page request failed for {ticker}: {exc}") from exc
 
     def parse_company_page(self, html: str) -> ParsedCompanyPage:
         soup = BeautifulSoup(html, "html.parser")
@@ -167,10 +176,13 @@ class PsxClient:
         )
 
     def fetch_market_indices(self) -> list[dict[str, Any]]:
-        with self._client() as client:
-            response = client.get("/")
-            response.raise_for_status()
-            html = response.text
+        try:
+            with self._client() as client:
+                response = client.get("/")
+                response.raise_for_status()
+                html = response.text
+        except httpx.HTTPError as exc:
+            raise DataFetchError(f"PSX market indices request failed: {exc}") from exc
 
         soup = BeautifulSoup(html, "html.parser")
         indices: list[dict[str, Any]] = []

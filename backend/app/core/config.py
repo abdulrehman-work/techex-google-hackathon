@@ -1,6 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +23,17 @@ class Settings(BaseSettings):
     user_agent: str = (
         "Mozilla/5.0 (compatible; TechexTradingAgent/1.0; +https://github.com/techex-hackathon)"
     )
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug_flag(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production", "false", "0", "no", "off"}:
+                return False
+            if normalized in {"dev", "development", "debug", "true", "1", "yes", "on"}:
+                return True
+        return value
 
 
 @lru_cache

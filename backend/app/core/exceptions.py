@@ -8,3 +8,7 @@ class TickerValidationError(BackendError):
 
 class DataFetchError(BackendError):
     """Raised when upstream market data cannot be retrieved."""
+
+
+class AiPipelineError(BackendError):
+    """Raised when the AI agent pipeline cannot complete."""
