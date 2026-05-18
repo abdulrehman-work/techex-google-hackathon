@@ -5,3 +5,20 @@ __pycache__/
 .pytest_cache/
 .env
 *.egg-info/
+
+# Frontend (dependencies & build output — do not commit)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+node_modules/
+dist/
+
+# Logs & OS
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.DS_Store
