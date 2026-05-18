@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     filings_max_items: int = 3
     macro_config_path: str = str(_DEFAULT_MACRO_CONFIG)
     user_agent: str = (
-        "Mozilla/5.0 (compatible; TechexTradingAgent/1.0; +https://github.com/techex-hackathon)"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
     @field_validator("debug", mode="before")

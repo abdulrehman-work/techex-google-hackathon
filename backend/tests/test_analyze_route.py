@@ -100,14 +100,59 @@ class AnalyzeRouteTests(unittest.TestCase):
         response = self.client.post("/api/analyze", json={"ticker": "bad ticker!"})
         self.assertEqual(response.status_code, 400)
 
-    @patch("app.services.analyze_workflow.PsxClient.fetch_company_page")
-    def test_analyze_returns_502_when_psx_fetch_fails(self, mock_fetch_html) -> None:
-        mock_fetch_html.side_effect = DataFetchError("PSX company page request failed for ENGRO.")
+    @patch("app.services.analyze_workflow.PsxClient.fetch_eod_bars")
+    def test_analyze_returns_502_when_psx_eod_fetch_fails(self, mock_eod) -> None:
+        mock_eod.side_effect = DataFetchError("PSX EOD request failed for ENGRO.")
 
         response = self.client.post("/api/analyze", json={"ticker": "ENGRO"})
 
         self.assertEqual(response.status_code, 502)
-        self.assertIn("PSX company page request failed", response.json()["detail"])
+        self.assertIn("PSX EOD request failed", response.json()["detail"])
+
+    @patch("app.services.analyze_workflow.PsxClient.fetch_latest_intraday_price", return_value=None)
+    @patch("app.services.ai_orchestrator.run_pipeline")
+    @patch("app.services.analyze_workflow.PsxClient.fetch_company_page")
+    @patch("app.services.analyze_workflow.NewsService.get_company_news", return_value=[])
+    @patch("app.services.analyze_workflow.MacroService.get_macro_context")
+    @patch("app.services.analyze_workflow.PsxClient.fetch_eod_bars")
+    def test_analyze_uses_eod_fallback_when_company_page_blocked(
+        self,
+        mock_eod,
+        mock_macro,
+        _mock_news,
+        mock_fetch_html,
+        mock_run_pipeline,
+        _mock_intraday,
+    ) -> None:
+        mock_eod.return_value = [
+            EodBar(timestamp=1, close=312.5, volume=1_200_000, open_price=308.0),
+            EodBar(timestamp=0, close=308.2, volume=900_000, open_price=305.0),
+        ]
+        mock_fetch_html.side_effect = DataFetchError(
+            "PSX company page request failed for ENGRO: Server disconnected without sending a response."
+        )
+        mock_macro.return_value = MacroContextData(
+            sbp_policy_rate="11.50%",
+            pkr_usd_trend="stable",
+            inflation_view="moderating",
+            oil_price_risk="medium",
+            market_condition="neutral",
+        )
+        mock_run_pipeline.return_value = {
+            "ticker": "ENGRO",
+            "signal": "HOLD",
+            "confidence": 68,
+            "opportunityScore": 61,
+            "governanceStatus": "APPROVED",
+            "governanceReason": "ok",
+            "breakdown": {},
+        }
+
+        response = self.client.post("/api/analyze", json={"ticker": "ENGRO"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["meta"]["psxProfileSource"], "eod-fallback")
+        self.assertEqual(response.json()["context"]["companyProfile"]["companyName"], "ENGRO")
 
     @patch("app.services.ai_orchestrator.run_pipeline")
     def test_analyze_context_runs_ai_pipeline_from_payload(self, mock_run_pipeline) -> None:

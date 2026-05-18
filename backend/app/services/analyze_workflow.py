@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from app.clients.psx_client import PsxClient
+from app.clients.psx_client import PsxClient, fallback_company_page
+from app.core.exceptions import DataFetchError
 from app.core.validators import validate_ticker
 from app.schemas.api import AnalyzeResponse
 from app.services.ai_orchestrator import AiOrchestrator
@@ -48,9 +49,14 @@ class AnalyzeWorkflow:
     def run(self, raw_ticker: str) -> AnalyzeResponse:
         ticker = validate_ticker(raw_ticker)
 
-        company_html = self._psx.fetch_company_page(ticker)
-        company_page = self._psx.parse_company_page(company_html)
         eod_bars = self._psx.fetch_eod_bars(ticker)
+        psx_profile_source = "html"
+        try:
+            company_html = self._psx.fetch_company_page(ticker)
+            company_page = self._psx.parse_company_page(company_html)
+        except DataFetchError:
+            company_page = fallback_company_page(ticker, eod_bars)
+            psx_profile_source = "eod-fallback"
 
         company_profile = self._company_service.get_company_profile(
             ticker,
@@ -97,5 +103,8 @@ class AnalyzeWorkflow:
         return self._response_builder.build_frontend_response(
             context=context,
             analysis=analysis,
-            meta={"services": "company,psx,fundamentals,filings,news,macro,risk,context"},
+            meta={
+                "services": "company,psx,fundamentals,filings,news,macro,risk,context",
+                "psxProfileSource": psx_profile_source,
+            },
         )

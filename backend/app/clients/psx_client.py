@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -43,7 +44,12 @@ class PsxClient:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
-        self._headers = {"User-Agent": self._settings.user_agent}
+        self._headers = {
+            "User-Agent": self._settings.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{self._settings.psx_base_url}/",
+        }
 
     def _client(self) -> httpx.Client:
         return httpx.Client(
@@ -97,13 +103,20 @@ class PsxClient:
         return float(data[0][1])
 
     def fetch_company_page(self, ticker: str) -> str:
-        try:
-            with self._client() as client:
-                response = client.get(f"/company/{ticker}")
-                response.raise_for_status()
-                return response.text
-        except httpx.HTTPError as exc:
-            raise DataFetchError(f"PSX company page request failed for {ticker}: {exc}") from exc
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                with self._client() as client:
+                    response = client.get(f"/company/{ticker}")
+                    response.raise_for_status()
+                    return response.text
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+        raise DataFetchError(
+            f"PSX company page request failed for {ticker}: {last_error}"
+        ) from last_error
 
     def parse_company_page(self, html: str) -> ParsedCompanyPage:
         soup = BeautifulSoup(html, "html.parser")
@@ -205,6 +218,39 @@ class PsxClient:
 def eod_bar_to_history_point(bar: EodBar) -> dict[str, Any]:
     date = datetime.fromtimestamp(bar.timestamp, tz=timezone.utc).date().isoformat()
     return {"date": date, "close": round(bar.close, 2), "volume": bar.volume}
+
+
+def fallback_company_page(ticker: str, eod_bars: list[EodBar]) -> ParsedCompanyPage:
+    """Build minimal company context from EOD bars when PSX HTML is blocked."""
+    latest = eod_bars[0]
+    previous = eod_bars[1] if len(eod_bars) > 1 else latest
+    change_percent = _percent_change(latest.close, previous.close)
+
+    return ParsedCompanyPage(
+        company_name=ticker,
+        sector="General / PSX Listed",
+        business_description=(
+            f"PSX company profile HTML was unavailable for {ticker}. "
+            "Analysis uses end-of-day market data only."
+        ),
+        current_price=latest.close,
+        change_value=round(latest.close - previous.close, 2),
+        change_percent=change_percent,
+        volume=latest.volume,
+        open_price=latest.open_price,
+        ldcp=previous.close,
+        pe_ratio_ttm=None,
+        annual_eps=None,
+        latest_quarter_eps=None,
+        announcements=[],
+        payout_snippets=[],
+    )
+
+
+def _percent_change(current: float, previous: float) -> float:
+    if previous == 0:
+        return 0.0
+    return round(((current - previous) / previous) * 100.0, 2)
 
 
 def _text(node: Any) -> str:
